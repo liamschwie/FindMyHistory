@@ -68,6 +68,7 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 
 @interface FMHHistoryViewController () <UITableViewDataSource, UITableViewDelegate, MKMapViewDelegate>
 @property (nonatomic, copy) NSString *tagId, *name;
+@property (nonatomic, strong) NSDictionary *liveMetadata;
 @property (nonatomic, strong) NSArray<FMHRow*> *rows;
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) MKMapView *map;
@@ -171,29 +172,43 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 
 // Keep the summary scannable; backend metadata is available under Item Details.
 - (UIView *)buildHeader {
-	if (self.rows.count == 0) return nil;
+	if (self.rows.count == 0 && !self.liveMetadata) return nil;
 	FMHRow *latest = self.rows.firstObject;             // rows are newest-first
 	double oldestTs = ((FMHRow *)self.rows.lastObject).timestamp;
 	NSDateFormatter *df = [NSDateFormatter new]; df.dateStyle = NSDateFormatterShortStyle; df.timeStyle = NSDateFormatterShortStyle;
 	NSString *range = [NSString stringWithFormat:@"%@ – %@", [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:oldestTs]], [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:latest.timestamp]]];
-	NSString *batt = latest.batteryRaw >= 0 ? [NSString stringWithFormat:@"Battery raw %lld (scale unverified)", latest.batteryRaw] : @"Battery unknown";
-	NSString *own = latest.isOwned == 1 ? @"Owned" : (latest.isOwned == 0 ? @"Shared with you" : @"");
+	id liveStatus = self.liveMetadata[@"battery_label"];
+	NSString *battery = self.liveMetadata ? ([liveStatus isKindOfClass:NSString.class] ? liveStatus : nil) : latest.batteryLabel;
+	NSString *batt = FMHBatteryTitle(battery);
+	NSString *own = !latest ? @"" : latest.isOwned == 1 ? @"Owned" : (latest.isOwned == 0 ? @"Shared with you" : @"");
 	NSRelativeDateTimeFormatter *relative = [NSRelativeDateTimeFormatter new];
 	NSString *age = [relative localizedStringForDate:[NSDate dateWithTimeIntervalSince1970:latest.timestamp] relativeToDate:NSDate.date];
 	UILabel *summary = [UILabel new]; summary.numberOfLines = 0;
 	summary.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote]; summary.adjustsFontForContentSizeCategory = YES;
 	summary.textColor = UIColor.secondaryLabelColor;
-	summary.text = [NSString stringWithFormat:@"%lu fixes · Latest %@\n%@", (unsigned long)self.rows.count, age, range];
+	summary.text = self.rows.count ? [NSString stringWithFormat:@"%lu fixes · Latest %@\n%@", (unsigned long)self.rows.count, age, range] : @"No saved fixes in this time range";
+	UILabel *batteryText = [UILabel new]; batteryText.font = summary.font; batteryText.adjustsFontForContentSizeCategory = YES;
+	batteryText.textColor = UIColor.secondaryLabelColor; batteryText.numberOfLines = 0;
+	batteryText.text = [NSString stringWithFormat:@"%@ · %@", self.liveMetadata ? @"Latest battery report" : @"Last saved battery", batt];
+	UIImageView *batteryIcon = [[UIImageView alloc] initWithImage:FMHBatterySymbol(battery, summary.font)];
+	batteryIcon.tintColor = ([battery isEqual:@"replace"] || [battery isEqual:@"dead"]) ? UIColor.systemRedColor : UIColor.secondaryLabelColor;
+	batteryIcon.contentMode = UIViewContentModeScaleAspectFit; batteryIcon.isAccessibilityElement = NO;
+	[batteryIcon setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+	UIStackView *batteryRow = [[UIStackView alloc] initWithArrangedSubviews:@[batteryIcon, batteryText]];
+	batteryRow.spacing = 6; batteryRow.alignment = UIStackViewAlignmentCenter;
 	UIButton *details = [UIButton buttonWithType:UIButtonTypeSystem];
+	details.hidden = !latest;
 	[details setTitle:self.detailsExpanded ? @"Hide Item Details" : @"Item Details" forState:UIControlStateNormal];
 	details.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
 	details.titleLabel.adjustsFontForContentSizeCategory = YES;
 	details.accessibilityValue = self.detailsExpanded ? @"Expanded" : @"Collapsed";
 	[details addTarget:self action:@selector(toggleDetails) forControlEvents:UIControlEventTouchUpInside];
-	UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[summary, details]];
+	UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[summary, batteryRow, details]];
 	stack.axis = UILayoutConstraintAxisVertical; stack.alignment = UIStackViewAlignmentLeading; stack.spacing = 4;
-	if (self.detailsExpanded) {
-		NSMutableArray *bits = [NSMutableArray arrayWithObjects:@"At the latest recorded fix:", batt, nil];
+	if (self.detailsExpanded && latest) {
+		NSMutableArray *bits = [NSMutableArray arrayWithObject:@"At the latest recorded fix:"];
+		if (latest.batteryLabel.length) [bits addObject:[@"Battery " stringByAppendingString:FMHBatteryTitle(latest.batteryLabel)]];
+		if (latest.batteryRaw >= 0) [bits addObject:[NSString stringWithFormat:@"Legacy raw battery %lld (separate, unverified scale)", latest.batteryRaw]];
 		if (latest.firmware.length) [bits addObject:[@"Firmware " stringByAppendingString:latest.firmware]];
 		if (latest.serial.length) [bits addObject:[@"Serial " stringByAppendingString:latest.serial]];
 		if (own.length) [bits addObject:own];
@@ -231,6 +246,11 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 	double since = self.windowSeconds > 0 ? [[NSDate date] timeIntervalSince1970] - self.windowSeconds : 0;
 	NSString *tagId = self.tagId;
 	NSString *currentName = self.name;
+	FMHFetchTagMetadata(tagId, ^(NSDictionary *metadata) {
+		if (generation != self.loadGeneration) return;
+		self.liveMetadata = metadata;
+		self.table.tableHeaderView = [self buildHeader];
+	});
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{   // no DB I/O on the main thread
 		NSString *name = FMHLatestName(tagId) ?: currentName;
 		NSArray<FMHRow*> *rows = FMHQuery(tagId, since);
@@ -310,6 +330,10 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 	c.detailTextLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; c.detailTextLabel.adjustsFontForContentSizeCategory = YES;
 	c.detailTextLabel.textColor = UIColor.secondaryLabelColor;
 	c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", FMHSourceName(r.source), FMHAccStr(r.hAcc)];
+	c.imageView.image = FMHBatterySymbol(r.batteryLabel, c.detailTextLabel.font);
+	c.imageView.tintColor = ([r.batteryLabel isEqual:@"replace"] || [r.batteryLabel isEqual:@"dead"]) ? UIColor.systemRedColor : UIColor.secondaryLabelColor;
+	c.imageView.isAccessibilityElement = NO;
+	c.accessibilityValue = r.batteryLabel ? FMHBatteryTitle(r.batteryLabel) : nil;
 	c.textLabel.numberOfLines = 0; c.detailTextLabel.numberOfLines = 0;
 	c.accessoryType = UITableViewCellAccessoryDisclosureIndicator; c.accessibilityHint = @"Show this fix on the map";
 	return c;
@@ -337,7 +361,7 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 - (MKPointAnnotation *)annotationForRow:(FMHRow *)r {
 	MKPointAnnotation *a = [MKPointAnnotation new]; a.coordinate = CLLocationCoordinate2DMake(r.lat, r.lon);
 	a.title = [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:r.timestamp] dateStyle:NSDateFormatterShortStyle timeStyle:NSDateFormatterMediumStyle];
-	NSString *battery = r.batteryRaw >= 0 ? [NSString stringWithFormat:@" · Battery raw %lld", r.batteryRaw] : @"";
+	NSString *battery = r.batteryLabel ? [@" · Battery " stringByAppendingString:FMHBatteryTitle(r.batteryLabel)] : @"";
 	a.subtitle = [NSString stringWithFormat:@"%@ · %@%@", FMHSourceName(r.source), FMHAccStr(r.hAcc), battery];
 	return a;
 }
@@ -411,6 +435,7 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 			[rows addObject:@{@"tag_name": r.tagName ?: NSNull.null, @"serial": r.serial ?: NSNull.null,
 				@"lat": @(r.lat), @"lon": @(r.lon), @"h_acc": @(r.hAcc), @"timestamp": @(r.timestamp),
 				@"source": r.source ?: NSNull.null, @"battery_raw": @(r.batteryRaw), @"firmware": r.firmware ?: NSNull.null,
+				@"battery_label": r.batteryLabel ?: NSNull.null,
 				@"is_owned": @(r.isOwned)}];
 		}
 		NSError *error = nil;

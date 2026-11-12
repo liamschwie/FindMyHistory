@@ -7,6 +7,9 @@
 #import <objc/runtime.h>
 #import <malloc/malloc.h>
 #import <substrate.h>
+#import <dlfcn.h>
+#import <mach-o/loader.h>
+#import <ptrauth.h>
 #import "FMHShared.h"
 #import "FMHData.h"
 
@@ -23,6 +26,11 @@ static os_log_t LOG;
 - (NSString *)type; - (NSUUID *)identifier; - (NSString *)name; - (NSString *)systemVersion; - (long long)batteryLevel;
 - (NSString *)serialNumber; - (id<FMHHandle>)owner;
 @end
+@protocol FMHBeaconManager <NSObject>
+- (void)allBeaconsOfType:(NSString *)type completion:(void (^)(NSSet *beacons))completion;
+@end
+static __weak id<FMHBeaconManager> gBeaconManager;
+static BOOL gSnapshotInFlight;
 
 // ---- state (all access on gStateQ) ----
 static sqlite3 *gDB;
@@ -38,10 +46,9 @@ static NSString *gMeHandle;    // ponytail: "me" = the handle owning the most be
 static NSMutableSet<NSString*> *gBackfilled;   // tags whose old rows have been labeled this session
 static dispatch_source_t gFlushTimer;
 static const NSTimeInterval kLocBufMaxAge = 120.0;   // drop buffered locations older than this
+static NSArray<NSString *> *recoveryPaths(void);
 
-// NOTE: battery is stored as the raw backend status byte (0/1/2…) only. The scale is NOT verified — observed values
-// don't line up with any Find My low-battery warning, and the FMIPItemBatteryStatus enum ordering could make a higher
-// number mean *better*. So we deliberately do NOT map it to Full/Low; the UI shows the raw value marked "unverified".
+// Simple-beacon raw bytes and decoded SPBeacon battery categories are separate fields.
 
 static void openDB(void) {
 	NSString *path = FMHDBPath();
@@ -68,6 +75,7 @@ static void openDB(void) {
 		FMH_LOG("database initialization failed (%d): %{public}s", rc, sqlite3_errmsg(gDB));
 		sqlite3_close(gDB); gDB = NULL; return;
 	}
+	if (!gMeta.count) [gMeta addEntriesFromDictionary:FMHKnownAirTags(gDB)];
 	// retention prune (0 = keep forever)
 	NSInteger retention = FMHSettings.shared.retentionDays;
 	if (retention > 0) {
@@ -113,13 +121,21 @@ void FMHClearHistory(void (^completion)(NSError *error)) {
 		if (!gDB) openDB();
 		int rc = FMHClearPendingRows(gDB, gPending);
 		if (rc == SQLITE_OK) {
+			for (NSString *path in recoveryPaths()) if (![NSFileManager.defaultManager removeItemAtPath:path error:nil]) rc = SQLITE_IOERR_DELETE;
 			[gLocBuf removeAllObjects];  // Pre-clear fixes awaiting metadata must not return later.
 			if (gDB) sqlite3_wal_checkpoint_v2(gDB, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
 			historyChanged();
-		} else FMH_LOG("clear failed (%d); existing history and pending rows retained", rc);
+		} else FMH_LOG("clear failed (%d)", rc);
 		NSError *error = rc == SQLITE_OK ? nil : [NSError errorWithDomain:@"FindMyHistory" code:rc
-			userInfo:@{NSLocalizedDescriptionKey: @"History couldn't be cleared. Please try again."}];
+			userInfo:@{NSLocalizedDescriptionKey: @"History couldn't be completely cleared. Please try again."}];
 		dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(error); });
+	});
+}
+
+void FMHFetchTagMetadata(NSString *tagId, void (^completion)(NSDictionary *metadata)) {
+	dispatch_async(gStateQ, ^{
+		NSDictionary *metadata = gMeta[tagId];
+		dispatch_async(dispatch_get_main_queue(), ^{ completion(metadata); });
 	});
 }
 
@@ -170,7 +186,7 @@ static void appendRowLocked(NSString *uuid, NSDictionary *loc, NSDictionary *m) 
 		@"tag_name": m[@"name"] ?: [NSNull null],
 		@"lat": loc[@"lat"], @"lon": loc[@"lon"], @"h_acc": loc[@"acc"], @"timestamp": @(ts),
 		@"source": loc[@"src"] ?: [NSNull null],
-		@"battery_raw": @(batt), @"battery_label": [NSNull null],  // scale unverified — raw value is the truth
+		@"battery_raw": @(batt), @"battery_label": m[@"battery_label"] ?: NSNull.null,
 		@"firmware": m[@"fw"] ?: [NSNull null],
 		@"is_owned": @(isOwned),
 		@"serial": m[@"serial"] ?: [NSNull null],
@@ -207,10 +223,12 @@ static void backfillLocked(NSString *uuid) {
 }
 
 // Store latest metadata for an AirTag (durian); drain any locations buffered before metadata arrived.
-static void noteMeta(NSString *uuid, NSString *name, NSString *fw, long long batt, NSString *serial, NSString *ownerHandle) {
+static void noteMeta(NSString *uuid, NSString *name, NSString *fw, long long batt, NSString *serial, NSString *ownerHandle, BOOL decoded) {
 	if (!uuid) return;
 	dispatch_async(gStateQ, ^{
-		gMeta[uuid] = @{ @"name": name ?: [NSNull null], @"fw": fw ?: [NSNull null], @"batt": @(batt), @"serial": serial ?: [NSNull null] };
+		gMeta[uuid] = @{ @"name": name ?: [NSNull null], @"fw": fw ?: [NSNull null],
+			@"batt": decoded ? @-1 : @(batt), @"battery_label": decoded ? (FMHBatteryCase(batt) ?: NSNull.null) : NSNull.null,
+			@"serial": serial ?: [NSNull null] };
 		if (ownerHandle.length) gDurianOwner[uuid] = ownerHandle;
 		NSMutableArray *buf = gLocBuf[uuid];
 		if (buf.count) { for (NSDictionary *loc in buf) appendRowLocked(uuid, loc, gMeta[uuid]); [gLocBuf removeObjectForKey:uuid]; }
@@ -220,7 +238,7 @@ static void noteMeta(NSString *uuid, NSString *name, NSString *fw, long long bat
 
 // Record a location. If the tag's metadata is known, log now; else buffer until metadata confirms it's an AirTag.
 static void noteLocation(NSString *uuid, double lat, double lon, double acc, double ts, NSString *source) {
-	if (!uuid) return;
+	if (!uuid || !isfinite(lat) || !isfinite(lon) || fabs(lat) > 90 || fabs(lon) > 180 || !isfinite(ts) || ts <= 0 || !isfinite(acc)) return;
 	NSDictionary *loc = @{ @"lat": @(lat), @"lon": @(lon), @"acc": @(acc), @"ts": @(ts), @"src": source ?: [NSNull null], @"rx": @([[NSDate date] timeIntervalSince1970]) };
 	dispatch_async(gStateQ, ^{
 		NSDictionary *m = gMeta[uuid];
@@ -237,7 +255,68 @@ static void noteLocation(NSString *uuid, double lat, double lon, double acc, dou
 	});
 }
 
+// Verified native callback: NSSet only. Frida-created replacements are unsafe on this arm64e target.
+static void refreshMetadata(void) { // main queue
+	id<FMHBeaconManager> manager = gBeaconManager;
+	if (!manager || gSnapshotInFlight || ![manager respondsToSelector:@selector(allBeaconsOfType:completion:)]) return;
+	gSnapshotInFlight = YES;
+	[manager allBeaconsOfType:@"durian" completion:^(NSSet *beacons) {
+		@try {
+			if ([beacons isKindOfClass:NSSet.class] || [beacons isKindOfClass:NSArray.class]) for (id raw in beacons) {
+				id<FMHBeacon> b = raw;
+				if (![raw respondsToSelector:@selector(type)] || ![[b type] isEqualToString:@"durian"]) continue;
+				NSUUID *identifier = [b identifier];
+				if (![identifier isKindOfClass:NSUUID.class]) continue;
+				NSString *owner = nil;
+				if ([raw respondsToSelector:@selector(owner)]) { id<FMHHandle> handle = [b owner];
+					if ([handle respondsToSelector:@selector(destination)]) owner = [handle destination]; }
+				noteMeta(identifier.UUIDString, [b name], [b systemVersion], [b batteryLevel], [b serialNumber], owner, YES);
+			}
+		} @catch (__unused NSException *e) { FMH_LOG("metadata snapshot unavailable"); }
+		dispatch_async(gStateQ, ^{ historyChanged(); });
+		dispatch_async(dispatch_get_main_queue(), ^{ gSnapshotInFlight = NO; });
+	}];
+}
+
+static NSArray<NSString *> *recoveryPaths(void) {
+	NSString *dir = [FMHDBPath() stringByDeletingLastPathComponent];
+	NSMutableArray *paths = [NSMutableArray array];
+	for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil])
+		if ([name hasPrefix:@"pending-recovery-"] && [name hasSuffix:@".json"]) [paths addObject:[dir stringByAppendingPathComponent:name]];
+	return paths;
+}
+
+static void recoverBufferedFixesLocked(void) {
+	if (!gDB || !FMHSettings.shared.loggingEnabled) return;
+	NSMutableSet *enabled = [NSMutableSet set];
+	for (NSString *uuid in gMeta) if ([FMHSettings.shared isTagEnabled:uuid]) [enabled addObject:uuid];
+	for (NSString *path in recoveryPaths()) {
+		NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+		if (![attrs[NSFileType] isEqual:NSFileTypeRegular] || [attrs[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) continue;
+		NSData *data = [NSData dataWithContentsOfFile:path]; NSError *error = nil;
+		id document = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
+		NSArray *rows = document ? FMHRecoveryRows(document, gMeta, enabled, NSDate.date.timeIntervalSince1970, &error) : nil;
+		if (!rows) { FMH_LOG("recovery validation failed; file retained"); continue; }
+		NSMutableArray *batch = [rows mutableCopy]; NSUInteger inserted = 0;
+		int rc = FMHCommitPendingRows(gDB, batch, &inserted);
+		if (rc != SQLITE_OK) { FMH_LOG("recovery write failed (%d); file retained", rc); continue; }
+		if (![NSFileManager.defaultManager removeItemAtPath:path error:&error]) FMH_LOG("recovery file retained after commit; replay is deduplicated");
+		FMH_LOG("recovered %lu buffered AirTag fixes", (unsigned long)inserted);
+		if (inserted) historyChanged();
+	}
+}
+
 // ---- hooks (verified: re/RE_NOTES.md Phase 2 FINAL) ----
+
+%group Snapshot
+%hook SPBeaconManager
+- (id)init {
+	id manager = %orig;
+	if (manager) { gBeaconManager = manager; dispatch_async(dispatch_get_main_queue(), ^{ refreshMetadata(); }); }
+	return manager;
+}
+%end
+%end
 
 %group Loc
 %hook SPOwnerSessionLocationFetch
@@ -280,10 +359,11 @@ static void noteLocation(NSString *uuid, double lat, double lon, double acc, dou
 			NSString *fw = [raw respondsToSelector:@selector(systemVersion)] ? [b systemVersion] : nil;
 			long long batt = [raw respondsToSelector:@selector(batteryLevel)] ? [b batteryLevel] : -1;
 			NSString *serial = [raw respondsToSelector:@selector(serialNumber)] ? [b serialNumber] : nil;
-			noteMeta(uuid, name, fw, batt, serial, ownerHandle);
+			noteMeta(uuid, name, fw, batt, serial, ownerHandle, NO);
 		}
 		// after the whole batch (so gMeHandle is final on the serial queue), label any still-unlabeled tags.
 		dispatch_async(gStateQ, ^{ for (NSString *u in [gDurianOwner allKeys]) backfillLocked(u); });
+		dispatch_async(dispatch_get_main_queue(), ^{ refreshMetadata(); });
 	} @catch (__unused NSException *e) {}
 	%orig;
 }
@@ -295,6 +375,75 @@ static void noteLocation(NSString *uuid, double lat, double lon, double acc, dou
 
 static long fmhIvarOffset(Class c, const char *n) { Ivar iv = class_getInstanceVariable(c, n); return iv ? ivar_getOffset(iv) : -1; }
 static BOOL fmhIsUUID(NSString *s) { return s.length == 36 && [s characterAtIndex:8] == '-'; }
+static NSString *fmhDetailTagId(UIViewController *vc);
+static id fmhObjectIvar(id object, const char *name) {
+	Ivar ivar = class_getInstanceVariable(object_getClass(object), name);
+	return ivar ? object_getIvar(object, ivar) : nil;
+}
+
+static UIView *fmhNativeBattery(UIView *view, Class batteryClass) {
+	if ([view isKindOfClass:batteryClass]) return view;
+	for (UIView *child in view.subviews) { UIView *battery = fmhNativeBattery(child, batteryClass); if (battery) return battery; }
+	return nil;
+}
+
+typedef void (*FMHBatteryUpdater)(void *context __attribute__((swift_context))) __attribute__((swiftcall));
+static FMHBatteryUpdater fmhBatteryUpdater(Class batteryClass) {
+	static FMHBatteryUpdater update;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		Method layout = class_getInstanceMethod(batteryClass, @selector(layoutSubviews));
+		Dl_info image = {0};
+		if (!layout || !dladdr(ptrauth_strip((void *)method_getImplementation(layout), ptrauth_key_function_pointer), &image)) return;
+		const struct mach_header_64 *header = (const struct mach_header_64 *)image.dli_fbase;
+		if (!header || header->magic != MH_MAGIC_64 || header->filetype != MH_EXECUTE || header->sizeofcmds > 1024 * 1024) return;
+		const uint8_t expected[] = {0x88,0x1b,0x41,0x98,0x6b,0x43,0x3e,0x14,0x9c,0x5d,0x9d,0xfc,0x77,0x92,0xe9,0xb0};
+		const uint8_t *command = (const uint8_t *)(header + 1), *end = command + header->sizeofcmds;
+		for (uint32_t i = 0; i < header->ncmds && command + sizeof(struct load_command) <= end; i++) {
+			const struct load_command *lc = (const struct load_command *)command;
+			if (lc->cmdsize < sizeof(*lc) || lc->cmdsize > (size_t)(end - command)) return;
+			if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)
+				&& !memcmp(((const struct uuid_command *)lc)->uuid, expected, sizeof(expected))) {
+				// Native Swift fill updater, verified with 0/.15/.4/.8/1 -> widths 4/4/7.2/14.4/18 on this exact binary.
+				update = (FMHBatteryUpdater)ptrauth_sign_unauthenticated((uint8_t *)image.dli_fbase + 0x403078, ptrauth_key_function_pointer, 0);
+				return;
+			}
+			command += lc->cmdsize;
+		}
+	});
+	return update;
+}
+
+static void fmhUpdateBatteryHeader(UIViewController *vc, NSString *uuid) {
+	__weak UIViewController *weakVC = vc;
+	FMHFetchTagMetadata(uuid, ^(NSDictionary *metadata) {
+		UIViewController *vc = weakVC; if (!vc || !vc.view.window || ![fmhDetailTagId(vc) isEqual:uuid]) return;
+		id status = metadata[@"battery_label"];
+		double level = [status isKindOfClass:NSString.class] ? FMHBatteryFill(status) : -1;
+		UIView *wrapper = fmhObjectIvar(vc, "batteryIndicatorView");
+		Class batteryClass = objc_getClass("FindMy.FMBatteryView");
+		if (![wrapper isKindOfClass:UIView.class] || !batteryClass) return;
+		UIView *battery = fmhNativeBattery(wrapper, batteryClass);
+		// shortcut: Apple's private Double slot is verified on 17.3.1; re-verify before enabling another OS layout.
+		NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
+		if (!battery || os.majorVersion != 17 || os.minorVersion != 3 || os.patchVersion != 1) return;
+		FMHBatteryUpdater update = fmhBatteryUpdater(batteryClass); if (!update) return;
+		Ivar value = class_getInstanceVariable(batteryClass, "level"), next = class_getInstanceVariable(batteryClass, "isLowPowerEnabled");
+		if (!value || !next || ivar_getOffset(next) - ivar_getOffset(value) != sizeof(double)
+			|| ivar_getOffset(value) < class_getInstanceSize(class_getSuperclass(batteryClass))
+			|| ivar_getOffset(value) + sizeof(double) > class_getInstanceSize(batteryClass)) return;
+		if (level >= 0) {
+			memcpy((uint8_t *)(__bridge void *)battery + ivar_getOffset(value), &level, sizeof(level));
+			update((__bridge void *)battery);
+			wrapper.isAccessibilityElement = YES;
+			wrapper.accessibilityLabel = [@"Battery: " stringByAppendingString:FMHBatteryTitle(status)];
+			wrapper.accessibilityHint = @"Approximate category reported by Find My";
+		}
+		wrapper.hidden = level < 0;
+		NSLayoutConstraint *height = fmhObjectIvar(vc, "batteryIndicatorHeightConstraint");
+		if ([height isKindOfClass:NSLayoutConstraint.class]) height.constant = level < 0 ? 0 : MAX(battery.intrinsicContentSize.height, 12);
+	});
+}
 
 // Read a Swift String (16 bytes) at a KNOWN-good offset: small-string (inline) or bridged NSString.
 // Hardened: a large-string backing pointer is validated as a real heap object before it is ever messaged
@@ -323,18 +472,24 @@ static NSString *fmhDetailTagId(UIViewController *vc) {
 
 static const char *kFMHButtonKey = "fmh.btn";
 
+static void fmh_metadataChanged(UIViewController *vc, __unused SEL selector, __unused NSNotification *notification);
+
 static void fmhInstallHistoryButton(UIViewController *vc, NSString *uuid) {
-	if (!uuid || objc_getAssociatedObject(vc, kFMHButtonKey)) return;
-	objc_setAssociatedObject(vc, kFMHButtonKey, @YES, OBJC_ASSOCIATION_RETAIN);
+	if (!uuid) return;
+	UIButton *existing = objc_getAssociatedObject(vc, kFMHButtonKey);
+	if (existing) { existing.hidden = NO; return; }
 	// Use Apple's close-button renderer for the same circle, tint, and pressed appearance.
 	UIButton *btn = [UIButton buttonWithType:UIButtonTypeClose];
+	objc_setAssociatedObject(vc, kFMHButtonKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 	UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightBold];
 	[btn setImage:[UIImage systemImageNamed:@"clock.arrow.circlepath" withConfiguration:cfg] forState:UIControlStateNormal];
 	btn.translatesAutoresizingMaskIntoConstraints = NO;
 	btn.accessibilityLabel = @"History";
 	__weak UIViewController *wvc = vc;
 	[btn addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
-		FMHHistoryViewController *h = [[FMHHistoryViewController alloc] initWithTagId:uuid name:nil];
+		UIViewController *vc = wvc; NSString *selected = vc ? fmhDetailTagId(vc) : nil;
+		if (!selected) return;
+		FMHHistoryViewController *h = [[FMHHistoryViewController alloc] initWithTagId:selected name:nil];
 		UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:h];
 		[wvc presentViewController:nav animated:YES completion:nil];
 	}] forControlEvents:UIControlEventTouchUpInside];
@@ -348,10 +503,27 @@ static void fmhInstallHistoryButton(UIViewController *vc, NSString *uuid) {
 	]];
 }
 
+static void fmh_metadataChanged(UIViewController *vc, __unused SEL selector, __unused NSNotification *notification) {
+	@try {
+		if (!vc.isViewLoaded || !vc.view.window) return;
+		NSString *uuid = fmhDetailTagId(vc); if (!uuid) return;
+		__weak UIViewController *weakVC = vc;
+		FMHFetchTagMetadata(uuid, ^(NSDictionary *metadata) {
+			UIViewController *vc = weakVC;
+			if (!vc || !vc.view.window || ![fmhDetailTagId(vc) isEqual:uuid]) return;
+			UIButton *button = objc_getAssociatedObject(vc, kFMHButtonKey); button.hidden = !metadata;
+			if (metadata) { fmhInstallHistoryButton(vc, uuid); fmhUpdateBatteryHeader(vc, uuid); }
+		});
+	} @catch (__unused NSException *e) {}
+}
+
 static void (*orig_detailVDA)(UIViewController *, SEL, BOOL);
 static void fmh_detailVDA(UIViewController *vc, SEL _cmd, BOOL animated) {
 	orig_detailVDA(vc, _cmd, animated);
-	@try { NSString *uuid = fmhDetailTagId(vc); if (uuid) fmhInstallHistoryButton(vc, uuid); } @catch (__unused NSException *e) {}
+	refreshMetadata();
+	[[NSNotificationCenter defaultCenter] removeObserver:vc name:FMHHistoryDidChangeNotification object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:vc selector:NSSelectorFromString(@"fmhMetadataDidChange:") name:FMHHistoryDidChangeNotification object:nil];
+	fmh_metadataChanged(vc, NULL, nil);
 }
 
 static void onBackground(void) {
@@ -378,19 +550,24 @@ static void onBackground(void) {
 	gOwnerCount = [NSMutableDictionary dictionary];
 	gDurianOwner = [NSMutableDictionary dictionary];
 	gBackfilled = [NSMutableSet set];
-	dispatch_async(gStateQ, ^{ openDB(); });
+	dispatch_async(gStateQ, ^{ openDB(); recoverBufferedFixesLocked(); });
+	Class managerClass = objc_getClass("SPBeaconManager");
+	BOOL snapshotHealthy = managerClass && class_getInstanceMethod(managerClass, @selector(allBeaconsOfType:completion:));
+	if (snapshotHealthy) { %init(Snapshot); } else FMH_LOG("missing AirTag metadata snapshot API");
 
 	NSInteger inited = 0;
 	if (objc_getClass("SPBeaconManagerSimpleBeaconUpdateInterface")) { %init(Meta); inited++; } else FMH_LOG("missing SPBeaconManagerSimpleBeaconUpdateInterface");
 	if (objc_getClass("SPOwnerSessionLocationFetch")) { %init(Loc); inited++; } else FMH_LOG("missing SPOwnerSessionLocationFetch");
 
 	Class detailCls = objc_getClass("FindMy.FMItemDetailContentViewController");
-	if (detailCls) { MSHookMessageEx(detailCls, @selector(viewDidAppear:), (IMP)fmh_detailVDA, (IMP *)&orig_detailVDA); FMH_LOG("detail hook installed"); }
+	if (detailCls && class_addMethod(detailCls, NSSelectorFromString(@"fmhMetadataDidChange:"), (IMP)fmh_metadataChanged, "v@:@")) {
+		MSHookMessageEx(detailCls, @selector(viewDidAppear:), (IMP)fmh_detailVDA, (IMP *)&orig_detailVDA); FMH_LOG("detail hook installed");
+	}
 	else FMH_LOG("missing FMItemDetailContentViewController");
 	// Resilience: healthy only if BOTH classes AND their hooked selectors still exist (a renamed selector would
 	// otherwise leave %init succeeding while the hook never fires).
 	Class locCls = objc_getClass("SPOwnerSessionLocationFetch"), metaCls = objc_getClass("SPBeaconManagerSimpleBeaconUpdateInterface");
-	BOOL healthy = (inited == 2)
+	BOOL healthy = (inited == 2) && snapshotHealthy
 		&& locCls && class_getInstanceMethod(locCls, @selector(receivedUpdatedLocation:))
 		&& metaCls && class_getInstanceMethod(metaCls, @selector(receivedSimpleBeaconUpdates:));
 	if (!healthy) FMH_LOG("HOOKS UNHEALTHY — Find My internals changed; history will not update until the tweak is updated");
@@ -399,4 +576,5 @@ static void onBackground(void) {
 
 	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ onBackground(); }];
 	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification object:nil queue:nil usingBlock:^(__unused NSNotification *n){ onBackground(); }];
+	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n){ refreshMetadata(); }];
 }

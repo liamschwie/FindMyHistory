@@ -1,11 +1,20 @@
 // Shared helpers for FindMyHistory (tweak + History UI). On-device only.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import "FMHData.h"
+
+static inline UIImage *FMHBatterySymbol(NSString *status, UIFont *font) {
+	double fill = FMHBatteryFill(status);
+	if (fill < 0) return nil;
+	NSString *symbol = fill > 0.9 ? @"battery.100" : fill > 0.6 ? @"battery.75" : fill > 0.3 ? @"battery.50" : fill > 0 ? @"battery.25" : @"battery.0";
+	return [UIImage systemImageNamed:symbol withConfiguration:[UIImageSymbolConfiguration configurationWithFont:font]];
+}
 
 static NSString *const FMHHistoryDidChangeNotification = @"FMHHistoryDidChange";
 // Completes on the main queue, after deletion and pending-buffer handling on the logger queue.
 void FMHClearHistory(void (^completion)(NSError *error));
 void FMHFetchTagList(void (^completion)(NSArray<NSDictionary *> *tags));
+void FMHFetchTagMetadata(NSString *tagId, void (^completion)(NSDictionary *metadata));
 
 static inline NSString *FMHDBPath(void) {
 	NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/FindMyHistory"];

@@ -15,8 +15,10 @@ arm64 and arm64e slices. RootHide uses its own native package format and may req
   times with seconds, readable sources and accuracy. Tap a fix to show it on the map with its accuracy circle.
 - **Map trail**: full time-ordered polyline, with 24h / 7d / 30d / All windows. The map loads when selected. Large
   histories show fewer pins while retaining every fix in the trail and export.
-- **Item Details**: expandable raw battery (scale unverified), firmware, serial and ownership at the latest recorded
-  fix. The summary shows fix count, date range and age of the latest fix.
+- **Battery categories**: decoded Find My states with rough battery icons, category labels and export. The AirTag
+  card reuses Apple's native battery renderer beside last-seen text on the verified iOS 17.3.1 Find My build. Unknown
+  stays unknown; the icon does not claim an exact percentage.
+- **Item Details**: expandable firmware, serial, ownership and separate legacy raw battery at the latest recorded fix. The summary shows fix count, date range and age of the latest fix.
 - **Export**: CSV or JSON via the share sheet, with escaped text fields and fractional timestamp/accuracy precision.
   Files are prepared off the main thread, errors are shown, and temporary files are cleaned after sharing.
 - **In-app Settings** (gear button): master logging on/off, retention (30/90/180/365 days / Forever), per-AirTag
@@ -27,9 +29,11 @@ arm64 and arm64e slices. RootHide uses its own native package format and may req
   pre-clear fixes only after successful deletion. No history is deleted when updating the tweak.
 
 ## How it works
-Two read-only hooks in Apple's SearchParty client layer (see `findmyhistory/Tweak.xm`):
+Client-side capture in Apple's SearchParty layer (see `findmyhistory/Tweak.xm`):
 `SPOwnerSessionLocationFetch -receivedUpdatedLocation:` (locations) and
 `SPBeaconManagerSimpleBeaconUpdateInterface -receivedSimpleBeaconUpdates:` (name/battery/firmware/serial/owner).
+A native `SPBeaconManager` snapshot loads AirTag metadata at startup and on foreground entry. Previously confirmed
+AirTag identities also load from saved history, without treating old battery/firmware as current.
 Updates are joined in memory and written to WAL SQLite in a batched transaction (5 s debounce, force-flushed on
 background/terminate under a background-task assertion). No main-thread I/O — the logging path, the History queries,
 and every settings write run on background queues. Every hook is guarded — if a Find My update removes a hooked class *or selector*, the tweak
@@ -45,9 +49,15 @@ AirTags also don't report continuously — location comes from nearby iPhones an
 is inherently sparse, not a live track. Passive daemon hooks do not themselves request fresh reports. An active,
 bounded background wake/fetch is still being investigated; this release adds no scheduler or permanent keepalive.
 
-A startup metadata gap is also under investigation: logging can wait for the first AirTag metadata update even when
-cached items are visible. The in-memory location buffer is limited, so capture gaps are possible. A reliable initial
-metadata snapshot is needed before background refresh is added.
+Startup no longer depends only on a later simple-beacon update: a native snapshot bootstraps the AirTag catalog.
+Buffered recovery files from the earlier investigation are validated and imported transactionally on-device; failed
+imports retain their file and replay is deduplicated. Integration checks after installation are still pending.
+
+Decoded battery categories are `unknown`, `highPower`, `fresh`, `earlyLife`, `lateLife`, `replace`, and `dead`.
+Apple's approximate display fill is reused; it is not a measured charge percentage or a battery-health estimate.
+Historical `battery_raw` values use a separate, unverified path and are never converted retroactively. New exports
+append `battery_status`. Reports may be cached. The native card icon is guarded by the exact Find My binary UUID
+and runtime field layout; other builds retain the original card and can show categories in History.
 
 ## Requirements
 - iPhone on iOS 16.5.1–17.3.1, jailbroken with Relaxin/RootHide (ElleKit), with `openssh`. **Tested only on iOS 17.3.1
@@ -56,13 +66,15 @@ metadata snapshot is needed before background refresh is added.
   at `~/theos-roothide`, with its **rootless** package scheme.
 
 ## Install
+Battery/metadata preview: [v0.2.2](../../releases/tag/v0.2.2). The installed acceptance check is pending.
+
 **Prebuilt (easiest):** download the `.deb` from the [latest release](../../releases/latest) and install it in Sileo
 (or `dpkg -i`). Then open Find My.
 
 **Build from source:**
 ```bash
 make -C findmyhistory THEOS=~/theos-roothide clean package FINALPACKAGE=1
-# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.1_iphoneos-arm64.deb
+# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.2_iphoneos-arm64.deb
 make -C findmyhistory THEOS=~/theos-roothide install THEOS_DEVICE_IP=<device-ip>
 ```
 Logs: `idevicesyslog -m '[FMH]'`.
@@ -78,7 +90,7 @@ Logs: `idevicesyslog -m '[FMH]'`.
   first if you want it gone.
 
 ## Status
-v0.2.1 updates the rootless packaging, storage reliability, exports and History UI. The source includes the same tweak
-implementation currently installed on the test iPhone; package version metadata advances from the local development
-build. A clean build from this repository produces the release package. Battery values remain raw while their meaning
-is investigated; no battery percentage is claimed. Background refresh remains experimental and is not enabled.
+v0.2.2 is a preview for the battery display and startup metadata repair. Host data tests and both architecture builds
+pass. A signed native probe verified the snapshot returns nine AirTags on the test phone and the native renderer
+changes fill correctly. The complete installed tweak still needs a live acceptance check. Background refresh has
+no scheduler or permanent keepalive in this build; saving while leaving the foreground uses a finite flush assertion.
