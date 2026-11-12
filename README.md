@@ -45,6 +45,10 @@ AirTags also don't report continuously — location comes from nearby iPhones an
 is inherently sparse, not a live track. Passive daemon hooks do not themselves request fresh reports. An active,
 bounded background wake/fetch is still being investigated; this release adds no scheduler or permanent keepalive.
 
+A startup metadata gap is also under investigation: logging can wait for the first AirTag metadata update even when
+cached items are visible. The in-memory location buffer is limited, so capture gaps are possible. A reliable initial
+metadata snapshot is needed before background refresh is added.
+
 ## Requirements
 - iPhone on iOS 16.5.1–17.3.1, jailbroken with Relaxin/RootHide (ElleKit), with `openssh`. **Tested only on iOS 17.3.1
   (iPhone 15 Pro Max, arm64e)**; other versions are plausible but unverified, and Find My's internals may differ.
