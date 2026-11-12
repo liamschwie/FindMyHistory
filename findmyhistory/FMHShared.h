@@ -2,6 +2,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
+static NSString *const FMHHistoryDidChangeNotification = @"FMHHistoryDidChange";
+// Completes on the main queue, after deletion and pending-buffer handling on the logger queue.
+void FMHClearHistory(void (^completion)(NSError *error));
+void FMHFetchTagList(void (^completion)(NSArray<NSDictionary *> *tags));
+
 static inline NSString *FMHDBPath(void) {
 	NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/FindMyHistory"];
 	[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -26,7 +31,6 @@ static inline NSString *FMHDBPath(void) {
 @property (nonatomic) BOOL preciseAccuracy;    // YES = show accuracy to 0.1 m; NO (default) = round to whole meters
 - (BOOL)isTagEnabled:(NSString *)tagId;        // default YES unless explicitly disabled
 - (void)setTag:(NSString *)tagId enabled:(BOOL)enabled;
-- (void)clearAllData;
 @end
 
 // A view controller that shows one tag's history (List | Map) with export. Defined in HistoryVC.mm.

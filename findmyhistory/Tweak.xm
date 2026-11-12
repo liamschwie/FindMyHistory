@@ -1,5 +1,5 @@
 // FindMyHistory — logs own/shared AirTag location + battery/firmware history locally, inside Find My's sandbox.
-// Phase 3: two read-only hooks in Apple's SearchParty client layer, batched WAL SQLite, no main-thread I/O. On-device only.
+// Phase 3: two read-only hooks verified in re/RE_NOTES.md, batched WAL SQLite, no main-thread I/O. On-device only.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <sqlite3.h>
@@ -8,6 +8,7 @@
 #import <malloc/malloc.h>
 #import <substrate.h>
 #import "FMHShared.h"
+#import "FMHData.h"
 
 static os_log_t LOG;
 #define FMH_LOG(fmt, ...) os_log(LOG, "[FMH] " fmt, ##__VA_ARGS__)
@@ -35,34 +36,38 @@ static NSMutableDictionary<NSString*, NSNumber*> *gOwnerCount;  // owner handle 
 static NSMutableDictionary<NSString*, NSString*> *gDurianOwner; // AirTag uuid -> owner handle
 static NSString *gMeHandle;    // ponytail: "me" = the handle owning the most beacons; upgrade to share-graph if it ever misclassifies
 static NSMutableSet<NSString*> *gBackfilled;   // tags whose old rows have been labeled this session
-static BOOL gFlushScheduled;
+static dispatch_source_t gFlushTimer;
 static const NSTimeInterval kLocBufMaxAge = 120.0;   // drop buffered locations older than this
 
 // NOTE: battery is stored as the raw backend status byte (0/1/2…) only. The scale is NOT verified — observed values
 // don't line up with any Find My low-battery warning, and the FMIPItemBatteryStatus enum ordering could make a higher
 // number mean *better*. So we deliberately do NOT map it to Full/Low; the UI shows the raw value marked "unverified".
 
-static NSString *dbPath(void) {
-	NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/FindMyHistory"];
-	[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-	return [dir stringByAppendingPathComponent:@"history.sqlite"];
-}
-
 static void openDB(void) {
-	NSString *path = dbPath();
-	if (sqlite3_open([path UTF8String], &gDB) != SQLITE_OK) { FMH_LOG("open failed: %{public}s", sqlite3_errmsg(gDB)); gDB = NULL; return; }
-	char *err = NULL;
-	sqlite3_exec(gDB, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", NULL, NULL, &err);
-	sqlite3_exec(gDB,
+	NSString *path = FMHDBPath();
+	if (sqlite3_open([path UTF8String], &gDB) != SQLITE_OK) {
+		FMH_LOG("open failed: %{public}s", sqlite3_errmsg(gDB)); sqlite3_close(gDB); gDB = NULL; return;
+	}
+	sqlite3_busy_timeout(gDB, 2000);
+	int rc = sqlite3_exec(gDB, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+	if (rc == SQLITE_OK) rc = sqlite3_exec(gDB,
 		"CREATE TABLE IF NOT EXISTS locations("
 		"id INTEGER PRIMARY KEY, tag_id TEXT NOT NULL, tag_name TEXT,"
 		"lat REAL, lon REAL, h_acc REAL, timestamp REAL, source TEXT,"
 		"battery_raw INTEGER, battery_label TEXT, firmware TEXT, is_owned INTEGER, created_at REAL, serial_number TEXT);"
 		"CREATE INDEX IF NOT EXISTS idx_tag_time ON locations(tag_id, timestamp);"
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_dedup ON locations(tag_id, timestamp, lat, lon);",
-		NULL, NULL, &err);
-	if (err) { FMH_LOG("schema: %{public}s", err); sqlite3_free(err); }
-	sqlite3_exec(gDB, "ALTER TABLE locations ADD COLUMN serial_number TEXT", NULL, NULL, NULL); // upgrade older DBs; no-op if present
+		NULL, NULL, NULL);
+	if (rc == SQLITE_OK) {
+		sqlite3_stmt *check = NULL;
+		if (sqlite3_prepare_v2(gDB, "SELECT serial_number FROM locations LIMIT 0", -1, &check, NULL) != SQLITE_OK)
+			rc = sqlite3_exec(gDB, "ALTER TABLE locations ADD COLUMN serial_number TEXT", NULL, NULL, NULL);
+		sqlite3_finalize(check);
+	}
+	if (rc != SQLITE_OK) {
+		FMH_LOG("database initialization failed (%d): %{public}s", rc, sqlite3_errmsg(gDB));
+		sqlite3_close(gDB); gDB = NULL; return;
+	}
 	// retention prune (0 = keep forever)
 	NSInteger retention = FMHSettings.shared.retentionDays;
 	if (retention > 0) {
@@ -75,43 +80,79 @@ static void openDB(void) {
 	FMH_LOG("db ready at %{public}@", path);
 }
 
+static void historyChanged(void) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[[NSNotificationCenter defaultCenter] postNotificationName:FMHHistoryDidChangeNotification object:nil];
+	});
+}
+
+static void scheduleFlush(void);
 static void flushLocked(void) {   // call on gStateQ
-	gFlushScheduled = NO;
-	if (!gDB || gPending.count == 0) return;
-	NSArray *rows = gPending; gPending = [NSMutableArray array];
-	char *err = NULL; sqlite3_exec(gDB, "BEGIN", NULL, NULL, &err);
-	sqlite3_stmt *st;
-	const char *sql = "INSERT OR IGNORE INTO locations"
-		"(tag_id,tag_name,lat,lon,h_acc,timestamp,source,battery_raw,battery_label,firmware,is_owned,created_at,serial_number)"
-		" VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)";
-	if (sqlite3_prepare_v2(gDB, sql, -1, &st, NULL) != SQLITE_OK) { sqlite3_exec(gDB, "ROLLBACK", NULL, NULL, NULL); return; }
+	if (gFlushTimer) { dispatch_source_cancel(gFlushTimer); gFlushTimer = nil; }
+	if (!gPending.count) return;
+	if (!gDB) openDB();
 	NSUInteger n = 0;
-	for (NSDictionary *r in rows) {
-		sqlite3_bind_text  (st, 1, [r[@"tag_id"] UTF8String], -1, SQLITE_TRANSIENT);
-		id name = r[@"tag_name"]; name == [NSNull null] || !name ? sqlite3_bind_null(st, 2) : sqlite3_bind_text(st, 2, [name UTF8String], -1, SQLITE_TRANSIENT);
-		sqlite3_bind_double(st, 3, [r[@"lat"] doubleValue]);
-		sqlite3_bind_double(st, 4, [r[@"lon"] doubleValue]);
-		sqlite3_bind_double(st, 5, [r[@"h_acc"] doubleValue]);
-		sqlite3_bind_double(st, 6, [r[@"timestamp"] doubleValue]);
-		id src = r[@"source"]; src == [NSNull null] || !src ? sqlite3_bind_null(st, 7) : sqlite3_bind_text(st, 7, [src UTF8String], -1, SQLITE_TRANSIENT);
-		sqlite3_bind_int64 (st, 8, [r[@"battery_raw"] longLongValue]);
-		id blabel = r[@"battery_label"]; blabel == [NSNull null] || !blabel ? sqlite3_bind_null(st, 9) : sqlite3_bind_text(st, 9, [blabel UTF8String], -1, SQLITE_TRANSIENT);
-		id fw = r[@"firmware"]; fw == [NSNull null] || !fw ? sqlite3_bind_null(st, 10) : sqlite3_bind_text(st, 10, [fw UTF8String], -1, SQLITE_TRANSIENT);
-		sqlite3_bind_int   (st, 11, [r[@"is_owned"] intValue]);
-		sqlite3_bind_double(st, 12, [r[@"created_at"] doubleValue]);
-		id serial = r[@"serial"]; serial == [NSNull null] || !serial ? sqlite3_bind_null(st, 13) : sqlite3_bind_text(st, 13, [serial UTF8String], -1, SQLITE_TRANSIENT);
-		if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(gDB) > 0) n++;
-		sqlite3_reset(st);
+	int rc = FMHCommitPendingRows(gDB, gPending, &n);
+	if (rc != SQLITE_OK) {
+		FMH_LOG("flush failed (%d); retaining %lu pending rows for retry", rc, (unsigned long)gPending.count);
+		scheduleFlush(); return;
 	}
-	sqlite3_finalize(st);
-	sqlite3_exec(gDB, "COMMIT", NULL, NULL, &err);
-	if (n) FMH_LOG("flushed %lu rows", (unsigned long)n);
+	if (n) { FMH_LOG("flushed %lu rows", (unsigned long)n); historyChanged(); }
 }
 
 static void scheduleFlush(void) {   // call on gStateQ
-	if (gFlushScheduled) return;
-	gFlushScheduled = YES;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), gStateQ, ^{ flushLocked(); });
+	if (gFlushTimer) return;
+	gFlushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gStateQ);
+	dispatch_source_set_timer(gFlushTimer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), DISPATCH_TIME_FOREVER, NSEC_PER_SEC / 4);
+	dispatch_source_set_event_handler(gFlushTimer, ^{ flushLocked(); });
+	dispatch_resume(gFlushTimer);
+}
+
+void FMHClearHistory(void (^completion)(NSError *error)) {
+	dispatch_async(gStateQ, ^{
+		if (!gDB) openDB();
+		int rc = FMHClearPendingRows(gDB, gPending);
+		if (rc == SQLITE_OK) {
+			[gLocBuf removeAllObjects];  // Pre-clear fixes awaiting metadata must not return later.
+			if (gDB) sqlite3_wal_checkpoint_v2(gDB, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+			historyChanged();
+		} else FMH_LOG("clear failed (%d); existing history and pending rows retained", rc);
+		NSError *error = rc == SQLITE_OK ? nil : [NSError errorWithDomain:@"FindMyHistory" code:rc
+			userInfo:@{NSLocalizedDescriptionKey: @"History couldn't be cleared. Please try again."}];
+		dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(error); });
+	});
+}
+
+void FMHFetchTagList(void (^completion)(NSArray<NSDictionary *> *tags)) {
+	dispatch_async(gStateQ, ^{
+		NSMutableDictionary *tags = [NSMutableDictionary dictionary];
+		sqlite3_stmt *st = NULL;
+		if (gDB && sqlite3_prepare_v2(gDB, "SELECT tag_id,tag_name,is_owned,MAX(timestamp) FROM locations GROUP BY tag_id", -1, &st, NULL) == SQLITE_OK) {
+			while (sqlite3_step(st) == SQLITE_ROW) {
+				const char *uuid = (const char *)sqlite3_column_text(st, 0), *name = (const char *)sqlite3_column_text(st, 1);
+				if (uuid) tags[@(uuid)] = @{@"tag_id": @(uuid), @"name": name ? @(name) : @(uuid), @"owned": @(sqlite3_column_int(st, 2))};
+			}
+		}
+		sqlite3_finalize(st); st = NULL;
+		if (gDB && sqlite3_prepare_v2(gDB, "SELECT tag_id FROM tag_settings", -1, &st, NULL) == SQLITE_OK) {
+			while (sqlite3_step(st) == SQLITE_ROW) {
+				const char *uuid = (const char *)sqlite3_column_text(st, 0);
+				if (uuid && !tags[@(uuid)]) tags[@(uuid)] = @{@"tag_id": @(uuid), @"name": @(uuid), @"owned": @-1};
+			}
+		}
+		sqlite3_finalize(st);
+		// Live metadata is already durian-filtered and remains available even after history is cleared.
+		for (NSString *uuid in gMeta) {
+			id name = gMeta[uuid][@"name"]; NSString *owner = gDurianOwner[uuid];
+			int owned = owner && gMeHandle ? ([owner isEqualToString:gMeHandle] ? 1 : 0) : -1;
+			tags[uuid] = @{@"tag_id": uuid, @"name": [name isKindOfClass:NSString.class] ? name : uuid, @"owned": @(owned)};
+		}
+		NSArray *list = [tags.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+			NSComparisonResult order = [b[@"owned"] compare:a[@"owned"]];
+			return order == NSOrderedSame ? [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]] : order;
+		}];
+		dispatch_async(dispatch_get_main_queue(), ^{ completion(list); });
+	});
 }
 
 // Build + enqueue one row by joining a buffered location dict with current metadata. Call on gStateQ.
@@ -196,7 +237,7 @@ static void noteLocation(NSString *uuid, double lat, double lon, double acc, dou
 	});
 }
 
-// ---- hooks ----
+// ---- hooks (verified: re/RE_NOTES.md Phase 2 FINAL) ----
 
 %group Loc
 %hook SPOwnerSessionLocationFetch
@@ -285,12 +326,11 @@ static const char *kFMHButtonKey = "fmh.btn";
 static void fmhInstallHistoryButton(UIViewController *vc, NSString *uuid) {
 	if (!uuid || objc_getAssociatedObject(vc, kFMHButtonKey)) return;
 	objc_setAssociatedObject(vc, kFMHButtonKey, @YES, OBJC_ASSOCIATION_RETAIN);
-	UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-	UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:19 weight:UIImageSymbolWeightSemibold];
+	// Use Apple's close-button renderer for the same circle, tint, and pressed appearance.
+	UIButton *btn = [UIButton buttonWithType:UIButtonTypeClose];
+	UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightBold];
 	[btn setImage:[UIImage systemImageNamed:@"clock.arrow.circlepath" withConfiguration:cfg] forState:UIControlStateNormal];
 	btn.translatesAutoresizingMaskIntoConstraints = NO;
-	btn.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.92];
-	btn.layer.cornerRadius = 22; btn.tintColor = UIColor.systemBlueColor;
 	btn.accessibilityLabel = @"History";
 	__weak UIViewController *wvc = vc;
 	[btn addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
@@ -303,8 +343,8 @@ static void fmhInstallHistoryButton(UIViewController *vc, NSString *uuid) {
 	// Sit to the LEFT of Apple's ✕ close button (top-trailing of the card), as a separate, easy target.
 	[NSLayoutConstraint activateConstraints:@[
 		[btn.trailingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.trailingAnchor constant:-66],
-		[btn.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:6],
-		[btn.widthAnchor constraintEqualToConstant:44], [btn.heightAnchor constraintEqualToConstant:44],
+		[btn.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:13],
+		[btn.widthAnchor constraintEqualToConstant:30], [btn.heightAnchor constraintEqualToConstant:30],
 	]];
 }
 
@@ -316,11 +356,15 @@ static void fmh_detailVDA(UIViewController *vc, SEL _cmd, BOOL animated) {
 
 static void onBackground(void) {
 	UIApplication *app = [UIApplication sharedApplication];
-	__block UIBackgroundTaskIdentifier bg = [app beginBackgroundTaskWithName:@"fmh.flush" expirationHandler:^{}];
+	__block UIBackgroundTaskIdentifier bg = UIBackgroundTaskInvalid;
+	void (^finish)(void) = ^{
+		if (bg != UIBackgroundTaskInvalid) { [app endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
+	};
+	bg = [app beginBackgroundTaskWithName:@"fmh.flush" expirationHandler:finish];
 	dispatch_async(gStateQ, ^{
 		flushLocked();
 		if (gDB) sqlite3_wal_checkpoint_v2(gDB, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
-		if (bg != UIBackgroundTaskInvalid) { [app endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
+		dispatch_async(dispatch_get_main_queue(), finish);
 	});
 }
 

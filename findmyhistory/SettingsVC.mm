@@ -10,6 +10,7 @@
 @interface FMHSettingsViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<FMHTagItem*> *tags;
+@property (nonatomic) BOOL clearing;
 @end
 
 @implementation FMHSettingsViewController
@@ -22,35 +23,22 @@
 	self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 	self.table.dataSource = self; self.table.delegate = self;
 	[self.view addSubview:self.table];
+	[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(historyChanged:) name:FMHHistoryDidChangeNotification object:nil];
 	[self reloadTags];
 }
 - (void)done { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
+- (void)historyChanged:(NSNotification *)notification { [self reloadTags]; }
 
-- (void)reloadTags {   // query off the main thread, update the table on it
-	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-		NSArray *tags = [self queryTags];
-		dispatch_async(dispatch_get_main_queue(), ^{ self.tags = tags; [self.table reloadData]; });
-	});
-}
-
-- (NSArray<FMHTagItem*> *)queryTags {
-	NSMutableArray *out = [NSMutableArray array];
-	sqlite3 *db;
-	if (sqlite3_open_v2([FMHDBPath() UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-		sqlite3_stmt *st;
-		if (sqlite3_prepare_v2(db, "SELECT tag_id, tag_name, MAX(is_owned) FROM locations GROUP BY tag_id ORDER BY MAX(is_owned) DESC, tag_name", -1, &st, NULL) == SQLITE_OK) {
-			while (sqlite3_step(st) == SQLITE_ROW) {
-				FMHTagItem *t = [FMHTagItem new];
-				const char *i = (const char *)sqlite3_column_text(st, 0); t.tagId = i ? @(i) : nil;
-				const char *n = (const char *)sqlite3_column_text(st, 1); t.name = n ? @(n) : t.tagId;
-				t.isOwned = sqlite3_column_int(st, 2);
-				if (t.tagId) [out addObject:t];
-			}
-			sqlite3_finalize(st);
+- (void)reloadTags {
+	FMHFetchTagList(^(NSArray<NSDictionary *> *tags) {
+		NSMutableArray *items = [NSMutableArray arrayWithCapacity:tags.count];
+		for (NSDictionary *tag in tags) {
+			FMHTagItem *item = [FMHTagItem new]; item.tagId = tag[@"tag_id"]; item.name = tag[@"name"]; item.isOwned = [tag[@"owned"] intValue];
+			[items addObject:item];
 		}
-		sqlite3_close(db);
-	}
-	return out;
+		self.tags = items; [self.table reloadData];
+	});
 }
 
 - (NSString *)retentionText {
@@ -96,8 +84,11 @@
 		FMHTagItem *t = self.tags[ip.row];
 		c.textLabel.text = t.name;
 		c.detailTextLabel.text = t.isOwned == 1 ? @"owned" : (t.isOwned == 0 ? @"shared" : @"");
-		UISwitch *sw = [UISwitch new]; sw.on = [FMHSettings.shared isTagEnabled:t.tagId]; sw.tag = ip.row;
-		[sw addTarget:self action:@selector(toggleTag:) forControlEvents:UIControlEventValueChanged];
+		UISwitch *sw = [UISwitch new]; sw.on = [FMHSettings.shared isTagEnabled:t.tagId];
+		NSString *tagId = t.tagId;
+		[sw addAction:[UIAction actionWithHandler:^(UIAction *action) {
+			[FMHSettings.shared setTag:tagId enabled:((UISwitch *)action.sender).on];
+		}] forControlEvents:UIControlEventValueChanged];
 		c.accessoryView = sw; c.selectionStyle = UITableViewCellSelectionStyleNone;
 	} else {
 		c.textLabel.text = @"Clear all history"; c.textLabel.textColor = UIColor.systemRedColor;
@@ -114,7 +105,6 @@
 
 - (void)toggleLogging:(UISwitch *)sw { FMHSettings.shared.loggingEnabled = sw.on; }
 - (void)togglePrecise:(UISwitch *)sw { FMHSettings.shared.preciseAccuracy = sw.on; }
-- (void)toggleTag:(UISwitch *)sw { FMHTagItem *t = self.tags[sw.tag]; [FMHSettings.shared setTag:t.tagId enabled:sw.on]; }
 
 - (void)pickRetention {
 	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Keep history" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
@@ -131,12 +121,18 @@
 }
 
 - (void)confirmClear {
+	if (self.clearing) return;
 	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Clear all history?" message:@"This permanently deletes every recorded location for all AirTags. This cannot be undone." preferredStyle:UIAlertControllerStyleAlert];
 	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 	[ac addAction:[UIAlertAction actionWithTitle:@"Delete All" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{   // DELETE can be large — keep it off the main thread
-			[FMHSettings.shared clearAllData];
-			dispatch_async(dispatch_get_main_queue(), ^{ [self reloadTags]; });
+		self.clearing = YES;
+		FMHClearHistory(^(NSError *error) {
+			self.clearing = NO;
+			if (error) {
+				UIAlertController *failure = [UIAlertController alertControllerWithTitle:@"Couldn't clear history" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+				[failure addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+				[self presentViewController:failure animated:YES completion:nil];
+			} else [self reloadTags];
 		});
 	}]];
 	[self presentViewController:ac animated:YES completion:nil];

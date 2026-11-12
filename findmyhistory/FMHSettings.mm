@@ -14,7 +14,7 @@
 
 - (sqlite3 *)open {
 	sqlite3 *db;
-	if (sqlite3_open([FMHDBPath() UTF8String], &db) != SQLITE_OK) return NULL;
+	if (sqlite3_open([FMHDBPath() UTF8String], &db) != SQLITE_OK) { sqlite3_close(db); return NULL; }
 	sqlite3_busy_timeout(db, 2000);
 	sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);"
 		"CREATE TABLE IF NOT EXISTS tag_settings(tag_id TEXT PRIMARY KEY, enabled INTEGER);", NULL, NULL, NULL);
@@ -69,7 +69,10 @@
 - (void)setLoggingEnabled:(BOOL)v { @synchronized (self) { _loggingEnabled = v; } [self persistKey:@"logging" intValue:v ? 1 : 0]; }
 - (void)setRetentionDays:(NSInteger)v { @synchronized (self) { _retentionDays = v; } [self persistKey:@"retention" intValue:v]; }
 - (void)setHooksHealthy:(BOOL)v { @synchronized (self) { _hooksHealthy = v; } [self persistKey:@"hooks_ok" intValue:v ? 1 : 0]; }
-- (void)setPreciseAccuracy:(BOOL)v { @synchronized (self) { _preciseAccuracy = v; } [self persistKey:@"precise_acc" intValue:v ? 1 : 0]; }
+- (void)setPreciseAccuracy:(BOOL)v {
+	@synchronized (self) { _preciseAccuracy = v; } [self persistKey:@"precise_acc" intValue:v ? 1 : 0];
+	[[NSNotificationCenter defaultCenter] postNotificationName:FMHHistoryDidChangeNotification object:nil];
+}
 
 - (BOOL)isTagEnabled:(NSString *)tagId {
 	if (!tagId) return YES;
@@ -89,13 +92,6 @@
 		}
 		sqlite3_close(db);
 	});
-}
-
-- (void)clearAllData {
-	sqlite3 *db = [self open]; if (!db) return;
-	sqlite3_exec(db, "DELETE FROM locations;", NULL, NULL, NULL);
-	sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
-	sqlite3_close(db);
 }
 
 @end
