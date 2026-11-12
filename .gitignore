@@ -1,0 +1,9 @@
+.theos/
+packages/
+re/binaries/
+re/smoke/.theos/
+re/smoke/packages/
+*.deb
+.DS_Store
+findmyhistory/.theos/
+findmyhistory/packages/

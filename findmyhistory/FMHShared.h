@@ -1,0 +1,39 @@
+// Shared helpers for FindMyHistory (tweak + History UI). On-device only.
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+
+static inline NSString *FMHDBPath(void) {
+	NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/FindMyHistory"];
+	[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+	return [dir stringByAppendingPathComponent:@"history.sqlite"];
+}
+
+// One logged fix.
+@interface FMHRow : NSObject
+@property (nonatomic) double lat, lon, hAcc, timestamp, createdAt;
+@property (nonatomic, copy) NSString *source, *batteryLabel, *firmware, *tagName, *serial;
+@property (nonatomic) long long batteryRaw;
+@property (nonatomic) int isOwned;
+@end
+
+// Process-wide settings, persisted in the same DB (settings/tag_settings tables). The logging hooks and the UI
+// are in one process (Find My), so a shared singleton is the whole story — no cross-sandbox prefs needed.
+@interface FMHSettings : NSObject
++ (instancetype)shared;
+@property (nonatomic) BOOL loggingEnabled;     // master switch (default YES)
+@property (nonatomic) NSInteger retentionDays; // 0 = forever (default 90)
+@property (nonatomic) BOOL hooksHealthy;       // NO if a Find My update broke our hook points (set by %ctor)
+@property (nonatomic) BOOL preciseAccuracy;    // YES = show accuracy to 0.1 m; NO (default) = round to whole meters
+- (BOOL)isTagEnabled:(NSString *)tagId;        // default YES unless explicitly disabled
+- (void)setTag:(NSString *)tagId enabled:(BOOL)enabled;
+- (void)clearAllData;
+@end
+
+// A view controller that shows one tag's history (List | Map) with export. Defined in HistoryVC.mm.
+@interface FMHHistoryViewController : UIViewController
+- (instancetype)initWithTagId:(NSString *)tagId name:(NSString *)name;
+@end
+
+// In-app settings screen (logging master, retention, per-tag toggles, clear data). Defined in SettingsVC.mm.
+@interface FMHSettingsViewController : UIViewController
+@end
