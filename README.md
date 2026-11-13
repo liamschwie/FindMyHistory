@@ -11,7 +11,7 @@ Packages use the standard **rootless** scheme and Debian architecture **`iphoneo
 arm64 and arm64e slices. RootHide uses its own native package format and may require conversion with its tooling.
 
 ## Features
-- **History timeline**: the clock matches Apple's close-button style. History shows the tag name, calendar-day sections,
+- **History timeline**: the clock matches Apple's close-button style and is prepared before the card's opening transition for already-confirmed AirTags. History shows the tag name, calendar-day sections,
   times with seconds, readable sources and accuracy. Tap a fix to show it on the map with its accuracy circle.
 - **Map trail**: full time-ordered polyline, with 24h / 7d / 30d / All windows. The map loads when selected. Large
   histories show fewer pins while retaining every fix in the trail and export.
@@ -67,7 +67,7 @@ and runtime field layout; other builds retain the original card and can show cat
   at `~/theos-roothide`, with its **rootless** package scheme.
 
 ## Install
-Battery/metadata preview: [v0.2.4](../../releases/tag/v0.2.4). The installed acceptance check is pending.
+Battery/metadata preview: [v0.2.5](../../releases/tag/v0.2.5). The installed acceptance check is pending.
 
 **Prebuilt (easiest):** download the `.deb` from the [latest release](../../releases/latest) and install it in Sileo
 (or `dpkg -i`). Then open Find My.
@@ -75,7 +75,7 @@ Battery/metadata preview: [v0.2.4](../../releases/tag/v0.2.4). The installed acc
 **Build from source:**
 ```bash
 make -C findmyhistory THEOS=~/theos-roothide clean package FINALPACKAGE=1
-# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.4_iphoneos-arm64.deb
+# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.5_iphoneos-arm64.deb
 make -C findmyhistory THEOS=~/theos-roothide install THEOS_DEVICE_IP=<device-ip>
 ```
 Logs: `idevicesyslog -m '[FMH]'`.
@@ -91,9 +91,9 @@ Logs: `idevicesyslog -m '[FMH]'`.
   first if you want it gone.
 
 ## Status
-v0.2.4 completes the separate battery view's image-layer setup. The prior build reserved the correct space but
-left the native image views unattached, so the icon was blank. The fix attaches the native outline, fill and
-charging image views and copies the stock renderer's tint/visibility configuration. An icon-only pixel test
-changed from fully transparent to a visible native battery, and the user confirmed it appears steadily on the
-open AirTag card. Host tests and both architecture builds pass. Installing v0.2.4 makes this correction persist
-across app launches; full updated-package installation remains to be confirmed. Background refresh remains disabled.
+v0.2.5 prepares History before the item-card transition using a main-queue snapshot of confirmed AirTag identities.
+The button no longer waits for the post-animation metadata callback or logger queue. Saved identities publish at
+database startup; live metadata refreshes update the snapshot. Unconfirmed items retain the existing metadata-gated
+fallback, and the action resolves the currently selected tag. A signed native lifecycle check on the test phone
+found exactly one button ready before each of five transitions (about 1 ms of setup). Host tests and both builds
+pass. Full updated-package install/relaunch remains to be confirmed. Background refresh remains disabled.

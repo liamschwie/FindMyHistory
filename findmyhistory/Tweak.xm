@@ -31,6 +31,7 @@ static os_log_t LOG;
 @end
 static __weak id<FMHBeaconManager> gBeaconManager;
 static BOOL gSnapshotInFlight;
+static NSSet<NSString *> *gUIAirTagIDs; // Immutable confirmed identities; read and replaced only on the main queue.
 
 // ---- state (all access on gStateQ) ----
 static sqlite3 *gDB;
@@ -76,6 +77,8 @@ static void openDB(void) {
 		sqlite3_close(gDB); gDB = NULL; return;
 	}
 	if (!gMeta.count) [gMeta addEntriesFromDictionary:FMHKnownAirTags(gDB)];
+	NSSet *knownIDs = [NSSet setWithArray:gMeta.allKeys];
+	dispatch_async(dispatch_get_main_queue(), ^{ gUIAirTagIDs = knownIDs; });
 	// retention prune (0 = keep forever)
 	NSInteger retention = FMHSettings.shared.retentionDays;
 	if (retention > 0) {
@@ -89,7 +92,9 @@ static void openDB(void) {
 }
 
 static void historyChanged(void) {
+	NSSet *knownIDs = [NSSet setWithArray:gMeta.allKeys];
 	dispatch_async(dispatch_get_main_queue(), ^{
+		gUIAirTagIDs = knownIDs;
 		[[NSNotificationCenter defaultCenter] postNotificationName:FMHHistoryDidChangeNotification object:nil];
 	});
 }
@@ -550,6 +555,16 @@ static void fmh_metadataChanged(UIViewController *vc, __unused SEL selector, __u
 }
 
 static void (*orig_detailVDA)(UIViewController *, SEL, BOOL);
+static void (*orig_detailVWA)(UIViewController *, SEL, BOOL);
+static void fmh_detailVWA(UIViewController *vc, SEL _cmd, BOOL animated) {
+	orig_detailVWA(vc, _cmd, animated);
+	@try {
+		NSString *uuid = fmhDetailTagId(vc);
+		if (uuid && [gUIAirTagIDs containsObject:uuid]) fmhInstallHistoryButton(vc, uuid);
+		else { UIButton *button = objc_getAssociatedObject(vc, kFMHButtonKey); button.hidden = YES; }
+	} @catch (__unused NSException *e) {}
+}
+
 static void fmh_detailVDA(UIViewController *vc, SEL _cmd, BOOL animated) {
 	orig_detailVDA(vc, _cmd, animated);
 	refreshMetadata();
@@ -593,6 +608,7 @@ static void onBackground(void) {
 
 	Class detailCls = objc_getClass("FindMy.FMItemDetailContentViewController");
 	if (detailCls && class_addMethod(detailCls, NSSelectorFromString(@"fmhMetadataDidChange:"), (IMP)fmh_metadataChanged, "v@:@")) {
+		MSHookMessageEx(detailCls, @selector(viewWillAppear:), (IMP)fmh_detailVWA, (IMP *)&orig_detailVWA);
 		MSHookMessageEx(detailCls, @selector(viewDidAppear:), (IMP)fmh_detailVDA, (IMP *)&orig_detailVDA); FMH_LOG("detail hook installed");
 	}
 	else FMH_LOG("missing FMItemDetailContentViewController");

@@ -1,6 +1,6 @@
 Package: com.liam.findmyhistory
 Name: FindMyHistory
-Version: 0.2.4
+Version: 0.2.5
 Architecture: iphoneos-arm64
 Description: Local AirTag location/battery history for Find My (on-device only).
 Maintainer: liam
