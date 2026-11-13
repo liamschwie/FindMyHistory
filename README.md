@@ -15,8 +15,9 @@ arm64 and arm64e slices. RootHide uses its own native package format and may req
   times with seconds, readable sources and accuracy. Tap a fix to show it on the map with its accuracy circle.
 - **Map trail**: full time-ordered polyline, with 24h / 7d / 30d / All windows. The map loads when selected. Large
   histories show fewer pins while retaining every fix in the trail and export.
-- **Battery categories**: decoded Find My states with rough battery icons, category labels and export. The AirTag
-  card reuses Apple's native battery renderer beside last-seen text on the verified iOS 17.3.1 Find My build. Unknown
+- **Battery categories**: decoded Find My states in one battery summary above the history list, with category labels and export. The AirTag
+  card reuses Apple's native battery renderer in a separate indicator beside last-seen text on the verified
+  iOS 17.3.1 Find My build. Native refreshes leave this indicator alone; location rows have no repeated battery icons. Unknown
   stays unknown; the icon does not claim an exact percentage.
 - **Item Details**: expandable firmware, serial, ownership and separate legacy raw battery at the latest recorded fix. The summary shows fix count, date range and age of the latest fix.
 - **Export**: CSV or JSON via the share sheet, with escaped text fields and fractional timestamp/accuracy precision.
@@ -66,7 +67,7 @@ and runtime field layout; other builds retain the original card and can show cat
   at `~/theos-roothide`, with its **rootless** package scheme.
 
 ## Install
-Battery/metadata preview: [v0.2.2](../../releases/tag/v0.2.2). The installed acceptance check is pending.
+Battery/metadata preview: [v0.2.3](../../releases/tag/v0.2.3). The installed acceptance check is pending.
 
 **Prebuilt (easiest):** download the `.deb` from the [latest release](../../releases/latest) and install it in Sileo
 (or `dpkg -i`). Then open Find My.
@@ -74,7 +75,7 @@ Battery/metadata preview: [v0.2.2](../../releases/tag/v0.2.2). The installed acc
 **Build from source:**
 ```bash
 make -C findmyhistory THEOS=~/theos-roothide clean package FINALPACKAGE=1
-# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.2_iphoneos-arm64.deb
+# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.3_iphoneos-arm64.deb
 make -C findmyhistory THEOS=~/theos-roothide install THEOS_DEVICE_IP=<device-ip>
 ```
 Logs: `idevicesyslog -m '[FMH]'`.
@@ -90,7 +91,9 @@ Logs: `idevicesyslog -m '[FMH]'`.
   first if you want it gone.
 
 ## Status
-v0.2.2 is a preview for the battery display and startup metadata repair. Host data tests and both architecture builds
-pass. A signed native probe verified the snapshot returns nine AirTags on the test phone and the native renderer
-changes fill correctly. The complete installed tweak still needs a live acceptance check. Background refresh has
-no scheduler or permanent keepalive in this build; saving while leaving the foreground uses a finite flush assertion.
+v0.2.3 fixes the battery indicator flickering during native card refreshes and removes repeated icons from the
+location rows. The header uses a separate instance of Apple's renderer, sized from the original native view.
+A signed on-device check of the production renderer passed through 10 native hide attempts, verified the native
+25×11-point size and category fill, and checked unknown-state hiding and repeated-update reuse. Host data tests
+and both architecture builds pass. The complete installed package still needs its acceptance check. Background
+refresh has no scheduler or permanent keepalive in this build; foreground exit uses a finite flush assertion.

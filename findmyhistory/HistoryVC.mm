@@ -330,10 +330,6 @@ static NSArray<FMHRow*> *FMHQuery(NSString *tagId, double sinceEpoch) {
 	c.detailTextLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; c.detailTextLabel.adjustsFontForContentSizeCategory = YES;
 	c.detailTextLabel.textColor = UIColor.secondaryLabelColor;
 	c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", FMHSourceName(r.source), FMHAccStr(r.hAcc)];
-	c.imageView.image = FMHBatterySymbol(r.batteryLabel, c.detailTextLabel.font);
-	c.imageView.tintColor = ([r.batteryLabel isEqual:@"replace"] || [r.batteryLabel isEqual:@"dead"]) ? UIColor.systemRedColor : UIColor.secondaryLabelColor;
-	c.imageView.isAccessibilityElement = NO;
-	c.accessibilityValue = r.batteryLabel ? FMHBatteryTitle(r.batteryLabel) : nil;
 	c.textLabel.numberOfLines = 0; c.detailTextLabel.numberOfLines = 0;
 	c.accessoryType = UITableViewCellAccessoryDisclosureIndicator; c.accessibilityHint = @"Show this fix on the map";
 	return c;

@@ -414,34 +414,57 @@ static FMHBatteryUpdater fmhBatteryUpdater(Class batteryClass) {
 	return update;
 }
 
+static const char *kFMHBatteryViewKey = "fmh.battery";
+
+static void fmhRenderBatteryHeader(UIViewController *vc, NSString *status) {
+	double level = FMHBatteryFill(status);
+	Class batteryClass = objc_getClass("FindMy.FMBatteryView");
+	UIStackView *row = fmhObjectIvar(vc, "tertiaryRowStackView");
+	if (!batteryClass || ![row isKindOfClass:UIStackView.class]) return;
+	// shortcut: Apple's private Double slot is verified on 17.3.1; re-verify before enabling another OS layout.
+	NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
+	if (os.majorVersion != 17 || os.minorVersion != 3 || os.patchVersion != 1) return;
+	FMHBatteryUpdater update = fmhBatteryUpdater(batteryClass); if (!update) return;
+	Ivar value = class_getInstanceVariable(batteryClass, "level"), next = class_getInstanceVariable(batteryClass, "isLowPowerEnabled");
+	if (!value || !next || ivar_getOffset(next) - ivar_getOffset(value) != sizeof(double)
+		|| ivar_getOffset(value) < class_getInstanceSize(class_getSuperclass(batteryClass))
+		|| ivar_getOffset(value) + sizeof(double) > class_getInstanceSize(batteryClass)) return;
+	UIView *battery = objc_getAssociatedObject(vc, kFMHBatteryViewKey);
+	if (!battery && level >= 0) {
+		UIView *reference = fmhNativeBattery(fmhObjectIvar(vc, "batteryIndicatorView"), batteryClass);
+		CGSize size = reference.bounds.size;
+		if (size.width <= 0 || size.height <= 0) size = [(UIView *)fmhObjectIvar(reference, "outlineView") intrinsicContentSize];
+		if (size.width <= 0 || size.height <= 0) return;
+		battery = [[batteryClass alloc] initWithFrame:(CGRect){CGPointZero, size}];
+		battery.translatesAutoresizingMaskIntoConstraints = NO;
+		NSLayoutConstraint *width = [battery.widthAnchor constraintEqualToConstant:size.width];
+		NSLayoutConstraint *height = [battery.heightAnchor constraintEqualToConstant:size.height];
+		width.priority = height.priority = UILayoutPriorityRequired - 1; // Let the stack collapse an unknown battery.
+		[NSLayoutConstraint activateConstraints:@[width, height]];
+		[battery setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+		[battery setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+		// Find My owns and repeatedly hides its stock slot; keep our indicator separate in the same native row.
+		NSUInteger labelIndex = [row.arrangedSubviews indexOfObject:fmhObjectIvar(vc, "tertiaryLabel")];
+		[row insertArrangedSubview:battery atIndex:labelIndex == NSNotFound ? row.arrangedSubviews.count : labelIndex + 1];
+		objc_setAssociatedObject(vc, kFMHBatteryViewKey, battery, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	}
+	if (!battery) return;
+	if (level >= 0) {
+		memcpy((uint8_t *)(__bridge void *)battery + ivar_getOffset(value), &level, sizeof(level));
+		update((__bridge void *)battery);
+		battery.isAccessibilityElement = YES;
+		battery.accessibilityLabel = [@"Battery: " stringByAppendingString:FMHBatteryTitle(status)];
+		battery.accessibilityHint = @"Approximate category reported by Find My";
+	}
+	battery.hidden = level < 0;
+}
+
 static void fmhUpdateBatteryHeader(UIViewController *vc, NSString *uuid) {
 	__weak UIViewController *weakVC = vc;
 	FMHFetchTagMetadata(uuid, ^(NSDictionary *metadata) {
 		UIViewController *vc = weakVC; if (!vc || !vc.view.window || ![fmhDetailTagId(vc) isEqual:uuid]) return;
 		id status = metadata[@"battery_label"];
-		double level = [status isKindOfClass:NSString.class] ? FMHBatteryFill(status) : -1;
-		UIView *wrapper = fmhObjectIvar(vc, "batteryIndicatorView");
-		Class batteryClass = objc_getClass("FindMy.FMBatteryView");
-		if (![wrapper isKindOfClass:UIView.class] || !batteryClass) return;
-		UIView *battery = fmhNativeBattery(wrapper, batteryClass);
-		// shortcut: Apple's private Double slot is verified on 17.3.1; re-verify before enabling another OS layout.
-		NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
-		if (!battery || os.majorVersion != 17 || os.minorVersion != 3 || os.patchVersion != 1) return;
-		FMHBatteryUpdater update = fmhBatteryUpdater(batteryClass); if (!update) return;
-		Ivar value = class_getInstanceVariable(batteryClass, "level"), next = class_getInstanceVariable(batteryClass, "isLowPowerEnabled");
-		if (!value || !next || ivar_getOffset(next) - ivar_getOffset(value) != sizeof(double)
-			|| ivar_getOffset(value) < class_getInstanceSize(class_getSuperclass(batteryClass))
-			|| ivar_getOffset(value) + sizeof(double) > class_getInstanceSize(batteryClass)) return;
-		if (level >= 0) {
-			memcpy((uint8_t *)(__bridge void *)battery + ivar_getOffset(value), &level, sizeof(level));
-			update((__bridge void *)battery);
-			wrapper.isAccessibilityElement = YES;
-			wrapper.accessibilityLabel = [@"Battery: " stringByAppendingString:FMHBatteryTitle(status)];
-			wrapper.accessibilityHint = @"Approximate category reported by Find My";
-		}
-		wrapper.hidden = level < 0;
-		NSLayoutConstraint *height = fmhObjectIvar(vc, "batteryIndicatorHeightConstraint");
-		if ([height isKindOfClass:NSLayoutConstraint.class]) height.constant = level < 0 ? 0 : MAX(battery.intrinsicContentSize.height, 12);
+		fmhRenderBatteryHeader(vc, [status isKindOfClass:NSString.class] ? status : nil);
 	});
 }
 
