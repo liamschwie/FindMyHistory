@@ -67,7 +67,7 @@ and runtime field layout; other builds retain the original card and can show cat
   at `~/theos-roothide`, with its **rootless** package scheme.
 
 ## Install
-Battery/metadata preview: [v0.2.3](../../releases/tag/v0.2.3). The installed acceptance check is pending.
+Battery/metadata preview: [v0.2.4](../../releases/tag/v0.2.4). The installed acceptance check is pending.
 
 **Prebuilt (easiest):** download the `.deb` from the [latest release](../../releases/latest) and install it in Sileo
 (or `dpkg -i`). Then open Find My.
@@ -75,7 +75,7 @@ Battery/metadata preview: [v0.2.3](../../releases/tag/v0.2.3). The installed acc
 **Build from source:**
 ```bash
 make -C findmyhistory THEOS=~/theos-roothide clean package FINALPACKAGE=1
-# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.3_iphoneos-arm64.deb
+# Output: findmyhistory/packages/com.liam.findmyhistory_0.2.4_iphoneos-arm64.deb
 make -C findmyhistory THEOS=~/theos-roothide install THEOS_DEVICE_IP=<device-ip>
 ```
 Logs: `idevicesyslog -m '[FMH]'`.
@@ -91,9 +91,9 @@ Logs: `idevicesyslog -m '[FMH]'`.
   first if you want it gone.
 
 ## Status
-v0.2.3 fixes the battery indicator flickering during native card refreshes and removes repeated icons from the
-location rows. The header uses a separate instance of Apple's renderer, sized from the original native view.
-A signed on-device check of the production renderer passed through 10 native hide attempts, verified the native
-25×11-point size and category fill, and checked unknown-state hiding and repeated-update reuse. Host data tests
-and both architecture builds pass. The complete installed package still needs its acceptance check. Background
-refresh has no scheduler or permanent keepalive in this build; foreground exit uses a finite flush assertion.
+v0.2.4 completes the separate battery view's image-layer setup. The prior build reserved the correct space but
+left the native image views unattached, so the icon was blank. The fix attaches the native outline, fill and
+charging image views and copies the stock renderer's tint/visibility configuration. An icon-only pixel test
+changed from fully transparent to a visible native battery, and the user confirmed it appears steadily on the
+open AirTag card. Host tests and both architecture builds pass. Installing v0.2.4 makes this correction persist
+across app launches; full updated-package installation remains to be confirmed. Background refresh remains disabled.

@@ -436,6 +436,15 @@ static void fmhRenderBatteryHeader(UIViewController *vc, NSString *status) {
 		if (size.width <= 0 || size.height <= 0) size = [(UIView *)fmhObjectIvar(reference, "outlineView") intrinsicContentSize];
 		if (size.width <= 0 || size.height <= 0) return;
 		battery = [[batteryClass alloc] initWithFrame:(CGRect){CGPointZero, size}];
+		// initWithFrame creates the image views but leaves their attachment/styling to Apple's wrapper.
+		for (NSString *name in @[@"outlineView", @"levelView", @"chargingView"]) {
+			UIImageView *image = fmhObjectIvar(battery, name.UTF8String);
+			UIImageView *original = fmhObjectIvar(reference, name.UTF8String);
+			if (![image isKindOfClass:UIImageView.class] || ![original isKindOfClass:UIImageView.class] || !image.image) return;
+			image.tintColor = original.tintColor;
+			image.hidden = original.hidden;
+			[battery addSubview:image];
+		}
 		battery.translatesAutoresizingMaskIntoConstraints = NO;
 		NSLayoutConstraint *width = [battery.widthAnchor constraintEqualToConstant:size.width];
 		NSLayoutConstraint *height = [battery.heightAnchor constraintEqualToConstant:size.height];
